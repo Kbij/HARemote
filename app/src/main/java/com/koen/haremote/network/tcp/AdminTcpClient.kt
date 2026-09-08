@@ -36,6 +36,13 @@ class AdminTcpClient(
         fun onClientList(clients: List<String>)
         fun onLocationHistory(response: LocationHistoryResponseMessage)
 
+        /** Called when an OBJ_LOCATION_HISTORY_RESPONSE frame arrived but [LocationHistoryResponseMessage.fromJson]
+         *  threw on it - unlike the other frame types handled in [connectAndPump], this one gets
+         *  surfaced instead of silently dropped via `getOrNull()`: it's the only lead available
+         *  for diagnosing "selected a client, nothing showed up" reports where the request
+         *  clearly went out and something clearly came back, yet [onLocationHistory] never fires. */
+        fun onLocationHistoryParseFailed(rawPayload: String, error: Throwable) {}
+
         /** Purely informational, e.g. for showing a "niet verbonden" hint on the admin screen. */
         fun onConnectionStateChanged(connected: Boolean) {}
     }
@@ -248,9 +255,10 @@ class AdminTcpClient(
                             }.getOrNull()?.let { listener.onClientList(it.clients) }
                         }
                         HcmProtocol.OBJ_LOCATION_HISTORY_RESPONSE -> {
-                            runCatching {
-                                LocationHistoryResponseMessage.fromJson(String(frame.payload, Charsets.US_ASCII))
-                            }.getOrNull()?.let { listener.onLocationHistory(it) }
+                            val raw = String(frame.payload, Charsets.US_ASCII)
+                            runCatching { LocationHistoryResponseMessage.fromJson(raw) }
+                                .onSuccess { listener.onLocationHistory(it) }
+                                .onFailure { e -> listener.onLocationHistoryParseFailed(raw, e) }
                         }
                         else -> Unit // Not relevant to admin mode.
                     }

@@ -18,6 +18,7 @@ object GeofenceState {
     private const val KEY_RADIUS = "radius"
     private const val KEY_CREATED_AT = "createdAt"
     private const val KEY_UPDATED_AT = "updatedAt"
+    private const val KEY_NEXT_RENEWAL_AT = "nextRenewalAt"
 
     /** Play Services geofence request id - there is only ever at most one, per client. */
     const val GEOFENCE_ID = "stationary"
@@ -76,6 +77,32 @@ object GeofenceState {
 
     fun clear(context: Context) {
         prefs(context).edit().clear().apply()
+    }
+
+    /**
+     * Wall-clock target ([System.currentTimeMillis]) for the next 30-minute renewal check.
+     * Persisted separately from the geofence fix itself and re-read by
+     * `LocationLoggingService.resumeGeofenceIfNeeded` on every service restart, so a restart
+     * re-arms the AlarmManager alarm for the *original* target instead of resetting the whole
+     * 30-minute countdown from "now". Without this, a device that kills and restarts the service
+     * more often than every 30 minutes (seen in the field - see the 8 sept 2026 diagnostics.log,
+     * five `onCreate`s inside 45 minutes) would push the renewal target back on every single
+     * restart and the check would never actually fire, silently stopping all location reporting
+     * for as long as the geofence stayed active.
+     */
+    fun saveNextRenewalAt(context: Context, atMillis: Long) {
+        prefs(context).edit().putLong(KEY_NEXT_RENEWAL_AT, atMillis).apply()
+    }
+
+    /** Null if there's no active geofence or no renewal has ever been scheduled for it. A value
+     *  in the past is expected (and fine) after the process was dead through its target time -
+     *  see [saveNextRenewalAt]'s doc comment; the caller re-arms the alarm for that same target,
+     *  which AlarmManager fires essentially immediately. */
+    fun nextRenewalAt(context: Context): Long? {
+        val p = prefs(context)
+        if (!p.getBoolean(KEY_ACTIVE, false)) return null
+        val value = p.getLong(KEY_NEXT_RENEWAL_AT, -1L)
+        return if (value > 0) value else null
     }
 
     /** Null when there's no active geofence. */

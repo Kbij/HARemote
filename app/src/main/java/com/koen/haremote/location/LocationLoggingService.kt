@@ -43,17 +43,26 @@ import kotlinx.coroutines.launch
  * GPSLogger keeps itself alive: a foreground notification, a partial wake lock, START_STICKY,
  * a boot receiver and a periodic watchdog alarm that restarts it if it gets killed.
  *
- * The server can push back a desired update interval (see [TcpLocationClient.Listener]); a short
- * interval means the server wants frequent, accurate fixes (GPS), a long one means it's fine with
- * an infrequent, coarser fix (network location) to save battery.
+ * The server can push back a desired update interval (see [TcpLocationClient.Listener]) — this
+ * is what [currentIntervalSeconds] tracks, and it splits the client's behaviour into two modes:
  *
- * Also owns the stationary-geofence feature: if the client hasn't moved for a while, a real
- * Play Services geofence (EXIT transition only, see [GeofenceBroadcastReceiver]) is registered
- * around it and reported to the server, with a 30-min renewal safety net
+ * - **`<= 0` — automatic mode.** The server has no specific cadence in mind, so the client
+ *   decides for itself: frequent GPS/network fixes ([AUTO_MOVING_INTERVAL_MS], 10s) while it's
+ *   moving, switching to the stationary-geofence feature below once it detects it has stopped -
+ *   the whole point being to save battery once nothing is actually changing.
+ * - **`> 0` — explicit mode.** The server wants fixes at exactly that cadence (e.g. 5s), always
+ *   via regular polling - no stationary detection, no geofence, ever (see [isAutoMode] and every
+ *   call site that checks it). If a geofence happens to already be active when an explicit
+ *   interval arrives, it's torn down immediately (see the `tcpListener` handler for
+ *   [TcpLocationClient.Listener.onLocationIntervalReceived]) so this mode's "always report via
+ *   GPS" guarantee actually holds.
+ *
+ * The stationary-geofence feature itself (automatic mode only): if the client hasn't moved for a
+ * while, a real Play Services geofence (EXIT transition only, see [GeofenceBroadcastReceiver]) is
+ * registered around it and reported to the server, with a 30-min renewal safety net
  * ([GeofenceRenewalAlarmScheduler]) on top in case the EXIT callback is ever missed. While that
  * geofence is active, regular GPS/network polling is paused entirely (see
- * [pauseLocationUpdatesForGeofence]) — the whole point of the feature is to save battery once the
- * client is confirmed stationary, so only the 30-min renewal check still touches location.
+ * [pauseLocationUpdatesForGeofence]) — only the 30-min renewal check still touches location.
  */
 class LocationLoggingService : Service(), LocationListener {
 
@@ -65,8 +74,8 @@ class LocationLoggingService : Service(), LocationListener {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** Interval (seconds) currently requested by the server; 0 = no explicit request, use the
-     *  app's own default cadence. Only touched on the main thread. */
+    /** Interval (seconds) currently requested by the server; `<= 0` = automatic mode, see the
+     *  class doc and [isAutoMode]. Only touched on the main thread. */
     private var currentIntervalSeconds = 0
 
     /** Trailing window of recent fixes, used only by the stationary-geofence heuristic (see
@@ -174,9 +183,20 @@ class LocationLoggingService : Service(), LocationListener {
         }
     }
 
+    /** Automatic mode (see class doc) vs. explicit mode - decides whether the stationary-geofence
+     *  feature is allowed to engage at all. `<= 0` = automatic; a positive server-requested
+     *  interval always means explicit, regular polling instead. */
+    private fun isAutoMode(): Boolean = currentIntervalSeconds <= 0
+
     /**
-     * (Re)requests location updates for the given server-requested interval:
-     * - `<= 0` (no explicit request): both GPS and network provider, our own default cadence.
+     * (Re)requests location updates for the given server-requested interval, always time-based
+     * (`minDistance = 0`) rather than also gating on distance travelled - simpler, and matches
+     * "frequent updates every N seconds" whether that N came from the server or from
+     * [AUTO_MOVING_INTERVAL_MS]:
+     * - `<= 0` (automatic mode): both GPS and network provider, [AUTO_MOVING_INTERVAL_MS] (10s) -
+     *   this is the "toestel in beweging" cadence; once the client is confirmed stationary,
+     *   [maybeCreateGeofence] takes over and this stops being called at all (see
+     *   [pauseLocationUpdatesForGeofence]).
      * - short interval (`1..HIGH_ACCURACY_THRESHOLD_SECONDS`): both providers again, at that
      *   exact cadence — the server wants frequent *and* accurate fixes, but see
      *   [locationProvidersFor]'s doc comment for why GPS-only was dropped (8 sept 2026): it left
@@ -184,11 +204,15 @@ class LocationLoggingService : Service(), LocationListener {
      * - longer interval: network provider only (falls back to GPS if unavailable) — accuracy
      *   doesn't matter as much, so prefer the cheaper provider.
      *
-     * **New (8 sept 2026):** a no-op while a stationary geofence is active — see
-     * [pauseLocationUpdatesForGeofence]'s doc comment for why. `currentIntervalSeconds` is still
-     * updated by the caller regardless (see [tcpListener]), so [resumeLocationUpdatesAfterGeofence]
-     * picks up the latest server-requested interval once the geofence clears, even if the server
-     * pushed a new one while it was active.
+     * A no-op while a stationary geofence is active — see [pauseLocationUpdatesForGeofence]'s doc
+     * comment for why. In practice this can now only happen in automatic mode: entering explicit
+     * mode tears any active geofence down immediately (see the `tcpListener` handler), so this
+     * guard is mostly about the moment *within* automatic mode where a geofence is active and a
+     * new (still automatic) interval request comes in - which can't actually happen either since
+     * the server has nothing to push in automatic mode, but the guard is cheap insurance either
+     * way. `currentIntervalSeconds` is still updated by the caller regardless (see [tcpListener]),
+     * so [resumeLocationUpdatesAfterGeofence] picks up the latest requested interval once the
+     * geofence clears.
      */
     private fun requestLocationUpdates(intervalSeconds: Int) {
         if (GeofenceState.load(applicationContext) != null) {
@@ -197,12 +221,12 @@ class LocationLoggingService : Service(), LocationListener {
         }
         try {
             locationManager.removeUpdates(this)
-            val minTimeMs = if (intervalSeconds > 0) intervalSeconds * 1000L else MIN_TIME_MS
-            val minDistanceM = if (intervalSeconds > 0) 0f else MIN_DISTANCE_M
+            val minTimeMs = if (intervalSeconds > 0) intervalSeconds * 1000L else AUTO_MOVING_INTERVAL_MS
             val providers = locationProvidersFor(intervalSeconds)
-            log("Location", "Locatie-updates aangevraagd: providers=$providers, minTime=${minTimeMs}ms, minDistance=${minDistanceM}m")
+            val modeLabel = if (intervalSeconds > 0) "expliciet interval" else "automatische modus"
+            log("Location", "Locatie-updates aangevraagd ($modeLabel): providers=$providers, minTime=${minTimeMs}ms, minDistance=0m")
             for (provider in providers) {
-                locationManager.requestLocationUpdates(provider, minTimeMs, minDistanceM, this)
+                locationManager.requestLocationUpdates(provider, minTimeMs, 0f, this)
             }
         } catch (e: SecurityException) {
             // Location permission not granted yet; MainActivity is responsible for
@@ -240,6 +264,18 @@ class LocationLoggingService : Service(), LocationListener {
     private fun resumeLocationUpdatesAfterGeofence() {
         log("Geofence", "Geofence niet langer actief - reguliere locatie-updates hervat (interval=${currentIntervalSeconds}s)")
         requestLocationUpdates(currentIntervalSeconds)
+    }
+
+    /** Starts a fresh 30-minute renewal countdown from now and persists the target (see
+     *  [GeofenceState.saveNextRenewalAt] / [GeofenceRenewalAlarmScheduler]'s doc comment) so a
+     *  service restart before it fires re-arms this same deadline instead of resetting it. Called
+     *  whenever a countdown legitimately restarts: a fresh geofence, or a renewal check that just
+     *  ran (successfully or not) - never from [resumeGeofenceIfNeeded], which re-arms the
+     *  *existing* target instead. */
+    private fun scheduleNextRenewal() {
+        val renewAt = System.currentTimeMillis() + GeofenceState.RENEWAL_INTERVAL_MS
+        GeofenceState.saveNextRenewalAt(applicationContext, renewAt)
+        GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext, renewAt)
     }
 
     /**
@@ -298,7 +334,12 @@ class LocationLoggingService : Service(), LocationListener {
             )
         )
 
-        maybeCreateGeofence(location)
+        // Stationary detection / geofencing is an automatic-mode-only feature (see class doc
+        // and isAutoMode()) - an explicit server interval means "always report via GPS at this
+        // cadence", full stop.
+        if (isAutoMode()) {
+            maybeCreateGeofence(location)
+        }
     }
 
     /**
@@ -409,7 +450,7 @@ class LocationLoggingService : Service(), LocationListener {
                     radiusMeters = GeofenceState.RADIUS_METERS
                 )
             )
-            GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext)
+            scheduleNextRenewal()
             recentFixes.clear()
             pauseLocationUpdatesForGeofence()
         }
@@ -424,7 +465,13 @@ class LocationLoggingService : Service(), LocationListener {
         log("Geofence", "Actieve geofence hervat op (${saved.latitude}, ${saved.longitude}) na (her)start van de service")
         addGeofenceToPlayServices(saved.latitude, saved.longitude, saved.radiusMeters) { success ->
             if (success) {
-                GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext)
+                // Re-arm the *existing* renewal deadline instead of starting a fresh 30-minute
+                // countdown - see GeofenceRenewalAlarmScheduler's doc comment for why that
+                // matters on a service that restarts more often than the renewal interval.
+                val renewAt = GeofenceState.nextRenewalAt(applicationContext)
+                    ?: (System.currentTimeMillis() + GeofenceState.RENEWAL_INTERVAL_MS)
+                GeofenceState.saveNextRenewalAt(applicationContext, renewAt)
+                GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext, renewAt)
                 pauseLocationUpdatesForGeofence()
             } else {
                 log("Geofence", "Geofence hervatten bij Play Services mislukt, lokale status opgeruimd")
@@ -519,7 +566,7 @@ class LocationLoggingService : Service(), LocationListener {
         requestSingleFreshLocation { location ->
             if (location == null) {
                 log("Geofence", "Vernieuwingscheck: geen locatie ontvangen, geofence-tijdstip niet vernieuwd")
-                GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext)
+                scheduleNextRenewal()
                 return@requestSingleFreshLocation
             }
 
@@ -540,7 +587,7 @@ class LocationLoggingService : Service(), LocationListener {
                         radiusMeters = saved.radiusMeters
                     )
                 )
-                GeofenceRenewalAlarmScheduler.scheduleRenewal(applicationContext)
+                scheduleNextRenewal()
             } else {
                 log("Geofence", "Vernieuwingscheck: buiten geofence (${distance}m) - exit-event gemist, alsnog opgeruimd")
                 clearGeofence("buiten geofence bij vernieuwingscheck")
@@ -664,6 +711,23 @@ class LocationLoggingService : Service(), LocationListener {
                 if (intervalSeconds == currentIntervalSeconds) return@post
                 log("Tcp", "Location interval changed: $currentIntervalSeconds -> $intervalSeconds")
                 currentIntervalSeconds = intervalSeconds
+                if (intervalSeconds > 0) {
+                    // Leaving automatic mode: the stilstand-window this client may have been
+                    // building up no longer applies (see isAutoMode()/maybeCreateGeofence) -
+                    // start clean in case automatic mode is re-entered later.
+                    recentFixes.clear()
+                    if (GeofenceState.load(applicationContext) != null) {
+                        // An explicit interval means "always report via GPS at this cadence" -
+                        // geofencing (and the polling pause that comes with it) is
+                        // automatic-mode-only, so switching away from automatic tears it down.
+                        // clearGeofence() calls resumeLocationUpdatesAfterGeofence() itself,
+                        // which re-requests updates at the (already-updated)
+                        // currentIntervalSeconds - no separate requestLocationUpdates() call
+                        // needed on this branch.
+                        clearGeofence("expliciet interval (${intervalSeconds}s) ontvangen - geofencing is enkel voor automatische modus")
+                        return@post
+                    }
+                }
                 requestLocationUpdates(intervalSeconds)
             }
         }
@@ -725,8 +789,11 @@ class LocationLoggingService : Service(), LocationListener {
     companion object {
         private const val CHANNEL_ID = "gps_logging_channel"
         private const val NOTIFICATION_ID = 4201
-        private const val MIN_TIME_MS = 60_000L
-        private const val MIN_DISTANCE_M = 25f
+
+        /** Automatic mode's "toestel in beweging" cadence - see the class doc and
+         *  [requestLocationUpdates]. Once the client is confirmed stationary, geofencing takes
+         *  over and this stops applying until it moves (or an explicit interval arrives). */
+        private const val AUTO_MOVING_INTERVAL_MS = 10_000L
         private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
 
         /** How often wakeLockRenewalRunnable re-acquires the wake lock — comfortably inside

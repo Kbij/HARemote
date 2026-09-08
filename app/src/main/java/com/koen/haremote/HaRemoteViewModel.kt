@@ -87,7 +87,31 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
             }
 
             override fun onLocationHistory(response: LocationHistoryResponseMessage) {
+                // No visibility at all into this before: koen asked "maar de server moet de
+                // locatie toch weten?" - fair question, since the geofence's coordinates are
+                // reported to the server separately (GeofenceStatusMessage) from a fresh GPS fix
+                // (GpsLocationMessage/`points`), and AdminMapScreen already draws the geofence
+                // circle independent of `points` being empty. This makes it possible to see, from
+                // the exported log alone, whether the server is actually returning that geofence
+                // info back (rather than guessing from the map screen, which gives no error if
+                // the circle simply never renders).
+                DiagnosticLogger.log(
+                    getApplication(),
+                    TAG_ADMIN,
+                    "Locatiegeschiedenis ontvangen voor ${response.client}: " +
+                        "${response.points.size} punt(en) in het gevraagde venster, " +
+                        "geofence=${response.geofence?.let { "actief (${it.latitude}, ${it.longitude}), laatst bevestigd ${it.updatedAtMillis}" } ?: "geen"}, " +
+                        "laatste connectie=${response.lastConnectionMillis}"
+                )
                 _adminLocationHistory.value = response
+            }
+
+            override fun onLocationHistoryParseFailed(rawPayload: String, error: Throwable) {
+                DiagnosticLogger.log(
+                    getApplication(),
+                    TAG_ADMIN,
+                    "Locatiegeschiedenis: antwoord ontvangen maar parsen mislukt (${error.message}) - raw: $rawPayload"
+                )
             }
 
             override fun onConnectionStateChanged(connected: Boolean) {
@@ -230,7 +254,12 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
      *  window changes - the server re-checks admin capability live on every call, there's no
      *  "already authenticated" shortcut to rely on here. */
     fun requestLocationHistory(client: String, minutes: Int = LocationHistoryRequestMessage.DEFAULT_MINUTES) {
-        adminTcpClient.sendLocationHistoryRequest(client, minutes)
+        val sent = adminTcpClient.sendLocationHistoryRequest(client, minutes)
+        DiagnosticLogger.log(
+            getApplication(),
+            TAG_ADMIN,
+            "Locatiegeschiedenis opgevraagd voor $client (laatste ${minutes}min): verzonden=$sent"
+        )
     }
 
     /** Clears everything from a previous admin session so leaving and re-entering admin mode
