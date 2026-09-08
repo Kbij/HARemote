@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -50,6 +51,8 @@ import com.koen.haremote.ui.theme.CinemaSurface
  *  to comfortably clear normal button-press jitter while still feeling deliberate, not
  *  accidental - this is a real navigation, not a subtle affordance. */
 private val ADMIN_SWIPE_THRESHOLD_DP = 96.dp
+
+private const val BUTTONS_PER_ROW = 2
 
 @Composable
 fun HomeScreen(
@@ -139,7 +142,7 @@ fun HomeScreen(
                     .padding(vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                buttons.chunked(2).forEach { rowButtons ->
+                buttons.chunked(BUTTONS_PER_ROW).forEach { rowButtons ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -153,6 +156,16 @@ fun HomeScreen(
                                 modifier = Modifier.weight(1f),
                                 onClick = { onButtonPressed(button) }
                             )
+                        }
+                        // An odd number of buttons leaves the last row incomplete. Without
+                        // this, that lone button's own Modifier.weight(1f) would claim the
+                        // *entire* row width (instead of the usual half), and since its
+                        // height is width-driven (aspectRatio(1.15f)), it would then demand
+                        // roughly double the height too - overflowing right past this row's
+                        // share of the screen. Invisible spacers keep every button the same
+                        // width (and therefore the same height) no matter how a row fills up.
+                        repeat(BUTTONS_PER_ROW - rowButtons.size) {
+                            Spacer(modifier = Modifier.weight(1f))
                         }
                     }
                 }
