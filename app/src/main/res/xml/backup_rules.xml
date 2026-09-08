@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Sample backup rules file; uncomment and customize as needed.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details. Do not place any sensitive data in the DataStore/SharedPreferences
+   that back up the REST tokens if you enable cloud backup for those.
+-->
+<full-backup-content>
+    <include domain="sharedpref" path="." />
+    <include domain="database" path="." />
+</full-backup-content>

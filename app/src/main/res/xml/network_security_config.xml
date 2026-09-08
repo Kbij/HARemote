@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Home Assistant is called over plain http:// on the local LAN, which Android blocks
+    by default for apps targeting API 28+. This explicitly allows cleartext traffic for
+    the app (it never talks to anything outside the local network anyway).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

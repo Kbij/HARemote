@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">HARemote</string>
+    <string name="notification_channel_name">GPS achtergrond logging</string>
+    <string name="notification_title">HARemote volgt je locatie</string>
+    <string name="notification_text">Verbonden · tikken om te openen</string>
+    <string name="notification_text_disconnected">Niet verbonden, opnieuw verbinden… · tikken om te openen</string>
+</resources>
