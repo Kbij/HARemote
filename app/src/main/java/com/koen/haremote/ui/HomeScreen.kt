@@ -247,6 +247,22 @@ private fun RemoteButton(
     val holdProgress = remember { Animatable(0f) }
     val haptic = LocalHapticFeedback.current
 
+    // Bug fix (koen, 9 sept 2026): without this, a completed hold left the button stuck fully
+    // gold-filled even after the REST call had long finished. Cause: onClick() firing flips
+    // isPending to true almost immediately (that's what the pending-pulse border above is
+    // for), which changes this composable's .pointerInput(button.id, isPending) key below -
+    // Compose cancels that coroutine outright on a key change, including the "ease back to 0f
+    // on release" tail end of the gesture handler, so it never got the chance to run and
+    // holdProgress was simply abandoned at ~1f. A separate LaunchedEffect(isPending) isn't
+    // subject to that same cancellation, so it reliably snaps the fill away the instant the
+    // call starts - the pending-pulse border immediately takes over as the "in flight"
+    // indicator, so this reads as "confirmed, now working" rather than a sudden blank.
+    LaunchedEffect(isPending) {
+        if (isPending) {
+            holdProgress.snapTo(0f)
+        }
+    }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
