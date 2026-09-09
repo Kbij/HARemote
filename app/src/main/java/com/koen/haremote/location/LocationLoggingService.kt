@@ -442,10 +442,18 @@ class LocationLoggingService : Service(), LocationListener {
 
         recentFixes.addLast(location)
         val cutoff = location.time - GeofenceState.STATIONARY_WINDOW_MS
-        while (recentFixes.isNotEmpty() && recentFixes.first().time < cutoff) {
-            recentFixes.removeFirst()
-        }
 
+        // Bug fix (9 sept 2026): fullness MUST be decided against the untrimmed oldest fix,
+        // before any eviction runs. The old code evicted every fix with time < cutoff first and
+        // only then checked "is the oldest surviving fix > cutoff" — but eviction already
+        // guarantees every survivor has time >= cutoff, so that check could only ever pass on
+        // exact millisecond equality (oldest.time == cutoff), which next-to-never happens with
+        // real fix timestamps. In practice the window asymptotically approached
+        // STATIONARY_WINDOW_MS and then fell back every time, for hours, instead of ever
+        // completing (see diagnostics.log from 9 sept 2026, 18:30-22:58). Checking first, then
+        // trimming, fixes this: the window counts as full as soon as an existing fix already
+        // reaches back far enough, regardless of where exactly its timestamp falls relative to
+        // the cutoff.
         val oldest = recentFixes.first()
         if (oldest.time > cutoff) {
             log(
@@ -454,6 +462,10 @@ class LocationLoggingService : Service(), LocationListener {
                     "${GeofenceState.STATIONARY_WINDOW_MS / 1000}s, ${recentFixes.size} fixes)"
             )
             return // window not fully covered yet
+        }
+
+        while (recentFixes.isNotEmpty() && recentFixes.first().time < cutoff) {
+            recentFixes.removeFirst()
         }
 
         val maxDistance = recentFixes.maxOf { accuracyAdjustedDistance(it, location) }
