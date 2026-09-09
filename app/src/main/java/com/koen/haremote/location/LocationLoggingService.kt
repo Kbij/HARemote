@@ -82,6 +82,12 @@ class LocationLoggingService : Service(), LocationListener {
      *  [maybeCreateGeofence]) — cleared whenever a geofence is active, created, or cleared. */
     private val recentFixes = ArrayDeque<Location>()
 
+    /** Most recent fix actually forwarded to the server (see [reportLocationIfBetter]) - not
+     *  every raw fix [onLocationChanged] receives, since both providers are requested
+     *  concurrently (see [locationProvidersFor]) and only one of the two needs to "win" per
+     *  cadence tick. */
+    private var lastAcceptedFix: Location? = null
+
     /**
      * Renews the wake lock on a fixed timer, independent of whether GPS fixes actually
      * arrive. [onLocationChanged] also renews it, but relying on that alone is exactly the
@@ -324,6 +330,51 @@ class LocationLoggingService : Service(), LocationListener {
         // no sky view, or the chip's own power-saving heuristics kicking in while stationary).
         log("Location", "fix ontvangen (provider=${location.provider}, accuracy=${location.accuracy}m)")
 
+        reportLocationIfBetter(location, "reguliere update")
+
+        // Stationary detection / geofencing is an automatic-mode-only feature (see class doc
+        // and isAutoMode()) - an explicit server interval means "always report via GPS at this
+        // cadence", full stop. Deliberately still fed every raw fix (not gated by
+        // reportLocationIfBetter's filter) - maybeCreateGeofence has its own, separate accuracy
+        // handling ([accuracyAdjustedDistance] / [GeofenceState.MAX_FIX_ACCURACY_FOR_STATIONARY_M])
+        // tuned for "is the client still", not "is this fix worth putting in the trajectory".
+        if (isAutoMode()) {
+            maybeCreateGeofence(location)
+        }
+    }
+
+    /**
+     * Bug fix (9 sept 2026): koen reported the admin-kaart trajectory had gone from a clean line
+     * to one with jumps of "several hundred meters", right after yesterday's fix that made short
+     * intervals request *both* GPS and network providers (to stop GPS going quiet for hours
+     * indoors - see [locationProvidersFor]'s doc comment). That fix worked, but had a side
+     * effect nobody caught: [onLocationChanged] forwarded *every* fix from *either* provider to
+     * the server unfiltered, and network-provider accuracy in koen's own log from this morning
+     * ranges from ~16m up to 899m in the same few minutes. Each of those got logged as a real
+     * point in the `Location` table (see [HomeControlDal.locationHistory] server-side) and
+     * plotted on the admin map, so the polyline zig-zagged between an accurate GPS point and a
+     * wildly-off network one every few seconds - exactly the "line jumping back and forth,
+     * hundreds of meters" koen described and screenshotted.
+     *
+     * Fix: a single choke point for every [GpsLocationMessage] this client ever sends (used by
+     * both this and [performGeofenceRenewalCheck]'s 30-min-confirmation fix), applying the
+     * classic Android "isBetterLocation" heuristic - accept [location] only if it is either
+     * meaningfully newer than [lastAcceptedFix] (the "GPS has gone quiet, take whatever network
+     * gives us" case yesterday's fix exists for) or not significantly *less* accurate than it.
+     * A wildly-off network fix arriving moments after a good GPS fix is simply dropped instead
+     * of being reported - it's still visible in the raw "[Location] fix ontvangen" log line
+     * above for diagnostics, just never reaches the server/trajectory.
+     */
+    private fun reportLocationIfBetter(location: Location, context: String) {
+        if (!isBetterFix(location, lastAcceptedFix)) {
+            log(
+                "Location",
+                "fix genegeerd ($context, te onnauwkeurig t.o.v. recentere fix): " +
+                    "provider=${location.provider} accuracy=${location.accuracy}m"
+            )
+            return
+        }
+        lastAcceptedFix = location
         tcpClient.sendLocation(
             GpsLocationMessage(
                 latitude = location.latitude,
@@ -333,13 +384,21 @@ class LocationLoggingService : Service(), LocationListener {
                 timestampMillis = location.time
             )
         )
+    }
 
-        // Stationary detection / geofencing is an automatic-mode-only feature (see class doc
-        // and isAutoMode()) - an explicit server interval means "always report via GPS at this
-        // cadence", full stop.
-        if (isAutoMode()) {
-            maybeCreateGeofence(location)
-        }
+    /**
+     * See [reportLocationIfBetter]'s doc comment. `last == null` always accepts (nothing to
+     * compare against yet). A negative [timeDeltaMs] (an out-of-order callback - can happen
+     * when two providers are both in flight) is rejected outright rather than compared on
+     * accuracy, since an older fix has no business overwriting a newer one regardless of how
+     * accurate it is.
+     */
+    private fun isBetterFix(new: Location, last: Location?): Boolean {
+        if (last == null) return true
+        val timeDeltaMs = new.time - last.time
+        if (timeDeltaMs < 0) return false
+        if (timeDeltaMs > STALE_FIX_THRESHOLD_MS) return true
+        return (new.accuracy - last.accuracy) <= ACCURACY_DEGRADATION_THRESHOLD_M
     }
 
     /**
@@ -595,15 +654,11 @@ class LocationLoggingService : Service(), LocationListener {
 
             // Also feed this fix into the normal reporting path - satisfies "confirm the GPS
             // location every 30 min regardless" independent of the geofence renewal above.
-            tcpClient.sendLocation(
-                GpsLocationMessage(
-                    latitude = location.latitude,
-                    longitude = location.longitude,
-                    accuracy = location.accuracy.toDouble(),
-                    batteryLevelPercent = currentBatteryLevelPercent(),
-                    timestampMillis = location.time
-                )
-            )
+            // Goes through the same reportLocationIfBetter() gate as the regular polling path:
+            // requestSingleFreshLocation() below races every provider and uses whichever
+            // responds first, which - same underlying issue as the regular polling fix above -
+            // could just as easily be a fast, inaccurate network fix as an accurate GPS one.
+            reportLocationIfBetter(location, "30-min vernieuwingscheck")
         }
     }
 
@@ -808,6 +863,21 @@ class LocationLoggingService : Service(), LocationListener {
 
         /** Timeout for the one-shot fix requested by performGeofenceRenewalCheck(). */
         private const val SINGLE_LOCATION_TIMEOUT_MS = 20_000L
+
+        /** See [isBetterFix]. A new fix is rejected if it's less accurate than the last accepted
+         *  one by more than this many meters, unless the last accepted fix is stale (see
+         *  [STALE_FIX_THRESHOLD_MS]). 50m comfortably passes a routine GPS-vs-GPS accuracy wobble
+         *  (single digits to ~15m in koen's own log) while still rejecting the 200-900m network
+         *  fixes that triggered this fix in the first place. */
+        private const val ACCURACY_DEGRADATION_THRESHOLD_M = 50f
+
+        /** See [isBetterFix]. If the last accepted fix is older than this, the next fix is
+         *  accepted regardless of accuracy - this is what preserves yesterday's "don't go quiet
+         *  for hours when GPS can't get a signal" fix: a lone, mediocre network fix is still far
+         *  better than no report at all once it's been this long. Comfortably above every polling
+         *  interval this app actually uses (5s-20s for the dual-provider branches this matters
+         *  for) so it never fires *within* normal back-to-back polling. */
+        private const val STALE_FIX_THRESHOLD_MS = 60_000L
 
         const val ACTION_STOP = "com.koen.haremote.action.STOP"
         const val ACTION_GEOFENCE_EXIT = "com.koen.haremote.action.GEOFENCE_EXIT"

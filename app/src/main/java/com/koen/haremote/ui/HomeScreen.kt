@@ -2,16 +2,18 @@ package com.koen.haremote.ui
 
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -21,14 +23,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,7 +37,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -46,6 +49,8 @@ import com.koen.haremote.ui.theme.CinemaGreen
 import com.koen.haremote.ui.theme.CinemaMutedText
 import com.koen.haremote.ui.theme.CinemaRed
 import com.koen.haremote.ui.theme.CinemaSurface
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 
 /** How far (in dp) a leftward drag has to travel before it counts as "swipe to admin". Chosen
  *  to comfortably clear normal button-press jitter while still feeling deliberate, not
@@ -197,6 +202,14 @@ private const val IDLE_BORDER_ALPHA = 0.55f
 private const val PENDING_BORDER_ALPHA_LOW = 0.30f
 private const val PENDING_PULSE_HALF_CYCLE_MS = 550
 
+/** How long (ms) a button must be held before it actually fires. Long enough to filter out a
+ *  brush/accidental tap on the grid, short enough that a deliberate press doesn't feel
+ *  sluggish. Was a plain tap-to-fire OutlinedButton before - koen reported that already
+ *  activated a sfeer on an accidental touch, so the fire-on-click moment moved from
+ *  "pointer down+up" to "pointer down for HOLD_DURATION_MS straight", with the gold fill
+ *  below as the visual feedback that a press is being timed at all. */
+private const val HOLD_DURATION_MS = 450
+
 @Composable
 private fun RemoteButton(
     button: ButtonConfig,
@@ -228,39 +241,84 @@ private fun RemoteButton(
         }
     }
 
-    OutlinedButton(
-        onClick = onClick,
-        enabled = !isPending,
+    // 0f..1f while a press is being timed. Its own Animatable (rather than a plain
+    // State<Float> nudged frame-by-frame) so both legs - filling up over HOLD_DURATION_MS,
+    // and easing back down if released early - are just animateTo calls.
+    val holdProgress = remember { Animatable(0f) }
+    val haptic = LocalHapticFeedback.current
+
+    Surface(
         modifier = modifier
             .fillMaxWidth()
-            .aspectRatio(1.15f),
+            .aspectRatio(1.15f)
+            // Re-installed whenever isPending flips or the button identity changes, which
+            // cancels any in-flight hold - a call going from pending back to idle mid-press,
+            // or the button list itself changing, can't leave a stale gesture detector
+            // hanging around waiting to fire on the wrong button.
+            .pointerInput(button.id, isPending) {
+                if (isPending) return@pointerInput
+                detectTapGestures(
+                    onPress = {
+                        coroutineScope {
+                            val fillJob = launch {
+                                holdProgress.snapTo(0f)
+                                holdProgress.animateTo(
+                                    targetValue = 1f,
+                                    animationSpec = tween(HOLD_DURATION_MS, easing = LinearEasing)
+                                )
+                                // Only reached if the fill animation ran to completion, i.e.
+                                // the finger was down for the full HOLD_DURATION_MS - a
+                                // release below cancels this coroutine before it gets here,
+                                // so a quick tap never reaches onClick().
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onClick()
+                            }
+                            tryAwaitRelease()
+                            fillJob.cancel()
+                            launch { holdProgress.animateTo(0f, tween(150)) }
+                        }
+                    }
+                )
+            },
         shape = RoundedCornerShape(20.dp),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = CinemaSurface,
-            disabledContainerColor = CinemaSurface
-        ),
-        border = BorderStroke(if (isPending) 1.5.dp else 1.dp, CinemaGold.copy(alpha = borderAlpha.value)),
-        contentPadding = PaddingValues(8.dp)
+        color = CinemaSurface,
+        border = BorderStroke(if (isPending) 1.5.dp else 1.dp, CinemaGold.copy(alpha = borderAlpha.value))
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.fillMaxSize()
-        ) {
-            Icon(
-                imageVector = button.icon.toImageVector(),
-                contentDescription = button.label,
-                tint = CinemaGold,
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Fills upward from the bottom as the hold is timed - Surface clips this to the
+            // rounded-corner shape above, so it never pokes out past the button's own border.
+            // This is the "feedback" koen asked for: without it the button would just sit
+            // there doing nothing for HOLD_DURATION_MS, indistinguishable from not registering
+            // the touch at all.
+            Box(
                 modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(fraction = holdProgress.value.coerceIn(0f, 1f))
+                    .align(Alignment.BottomCenter)
+                    .background(CinemaGold.copy(alpha = 0.28f))
             )
-            Text(
-                text = button.label.ifBlank { "Knop ${button.id}" },
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 2,
-                modifier = Modifier.padding(top = 8.dp),
-                fontWeight = FontWeight.SemiBold
-            )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(8.dp)
+            ) {
+                Icon(
+                    imageVector = button.icon.toImageVector(),
+                    contentDescription = button.label,
+                    tint = CinemaGold,
+                    modifier = Modifier
+                )
+                Text(
+                    text = button.label.ifBlank { "Knop ${button.id}" },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    modifier = Modifier.padding(top = 8.dp),
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
     }
 }
