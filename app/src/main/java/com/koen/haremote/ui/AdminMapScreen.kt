@@ -102,6 +102,22 @@ fun AdminMapScreen(
     val lastPoint = history?.points?.lastOrNull()
     val geofence = history?.geofence
 
+    // "Current position" for the marker/text/camera. Koen (10 sept 2026, after the first cut
+    // of this fallback): don't reason about whether a fresh GPS fix landed within the
+    // requested time window at all - while a geofence is active essentially nothing new comes
+    // in (GPS/network polling is fully paused, see "locatie-polling pauzeren", 8 sept), and
+    // the geofence is only ever cleared the moment the client actually moves. So as long as
+    // the server still reports it as active, its own coordinates ARE the current position,
+    // guaranteed - not merely a fallback for whenever `points` happens to be empty, but the
+    // authoritative answer whenever it's present, ahead of whatever `points` says (which can
+    // lag behind a renewal, or simply be empty if the window is shorter than the 30-min
+    // renewal interval).
+    val markerLatLng = when {
+        geofence != null -> LatLng(geofence.latitude, geofence.longitude)
+        lastPoint != null -> LatLng(lastPoint.latitude, lastPoint.longitude)
+        else -> null
+    }
+
     val cameraPositionState = rememberCameraPositionState()
 
     // The server now pushes a fresh LocationHistoryResponse live (whenever the watched client
@@ -117,16 +133,19 @@ fun AdminMapScreen(
 
     LaunchedEffect(history, mapLoaded) {
         val points = history?.points.orEmpty()
-        if (!mapLoaded || points.isEmpty() || hasFitCameraForClient) return@LaunchedEffect
+        if (!mapLoaded || hasFitCameraForClient) return@LaunchedEffect
+        if (points.isEmpty() && markerLatLng == null) return@LaunchedEffect
         hasFitCameraForClient = true
         runCatching {
-            if (points.size == 1) {
-                val only = LatLng(points[0].latitude, points[0].longitude)
-                cameraPositionState.animate(CameraUpdateFactory.newLatLngZoom(only, 16f))
-            } else {
+            if (points.size >= 2) {
                 val boundsBuilder = LatLngBounds.builder()
                 points.forEach { boundsBuilder.include(LatLng(it.latitude, it.longitude)) }
                 cameraPositionState.animate(CameraUpdateFactory.newLatLngBounds(boundsBuilder.build(), 120))
+            } else if (markerLatLng != null) {
+                // Either a single GPS point, or no points at all but a geofence to fall back
+                // on (see markerLatLng above) - either way there's exactly one location to
+                // center on, not a trajectory to fit bounds around.
+                cameraPositionState.animate(CameraUpdateFactory.newLatLngZoom(markerLatLng, 16f))
             }
         }.onFailure { e ->
             DiagnosticLogger.log(context, TAG_ADMIN_MAP, "Camera-animatie mislukt: ${e.message}")
@@ -198,7 +217,17 @@ fun AdminMapScreen(
                     )
                 }
 
-                if (lastPoint != null) {
+                if (geofence != null) {
+                    // An active geofence is authoritative for "current location" (see
+                    // markerLatLng above) - always show it here, even if `points` happens to
+                    // also contain a (necessarily older-or-equal) recent fix.
+                    Text(
+                        text = "Laatste locatie: geofence (bevestigd ${formatTimestamp(geofence.updatedAtMillis)})",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CinemaMutedText,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                } else if (lastPoint != null) {
                     Text(
                         text = "Laatste locatie: ${formatTimestamp(lastPoint.timestampMillis)}",
                         style = MaterialTheme.typography.bodySmall,
@@ -256,17 +285,32 @@ fun AdminMapScreen(
                         if (points.isNotEmpty()) {
                             val latLngs = points.map { LatLng(it.latitude, it.longitude) }
                             Polyline(points = latLngs, color = CinemaGold, width = 8f)
-                            // Keyed by the last fix's timestamp so a fresh MarkerState (and thus
-                            // an updated marker position) is created whenever new history comes
-                            // in - rememberMarkerState's `position` param is only an *initial*
-                            // value, it doesn't track later changes on its own.
+                        }
+
+                        // The red marker always tracks markerLatLng (last GPS fix, or the
+                        // geofence's own coordinates when there is no fresher fix in the
+                        // requested window - see markerLatLng above) rather than being gated on
+                        // `points` being non-empty. Previously this block lived inside the
+                        // `points.isNotEmpty()` check above, so a client sitting quietly inside
+                        // an active geofence with no recent fix in the requested window got no
+                        // marker at all - nothing on the map showed where it actually was, even
+                        // though the geofence circle below made clear one was active there.
+                        if (markerLatLng != null) {
+                            // Keyed by what's actually driving the position, so a fresh
+                            // MarkerState (and thus an updated marker position) is created
+                            // whenever new history comes in - rememberMarkerState's `position`
+                            // param is only an *initial* value, it doesn't track later changes
+                            // on its own. Geofence takes priority here too, matching
+                            // markerLatLng's own priority above.
+                            val markerKey = if (geofence != null) "geofence-${geofence.updatedAtMillis}"
+                                else lastPoint?.timestampMillis?.toString()
                             Marker(
-                                state = rememberMarkerState(
-                                    key = points.last().timestampMillis.toString(),
-                                    position = latLngs.last()
-                                ),
+                                state = rememberMarkerState(key = markerKey, position = markerLatLng),
                                 title = selectedClient,
-                                snippet = "Locatie om ${formatTimestamp(points.last().timestampMillis)}"
+                                snippet = if (geofence != null)
+                                    "Stilstaand (geofence), bevestigd ${formatTimestamp(geofence.updatedAtMillis)}"
+                                else
+                                    "Locatie om ${formatTimestamp(lastPoint?.timestampMillis ?: 0L)}"
                             )
                         }
 

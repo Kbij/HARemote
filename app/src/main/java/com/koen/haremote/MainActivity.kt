@@ -7,11 +7,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -82,6 +84,19 @@ class MainActivity : ComponentActivity() {
                     val adminLocationHistory by viewModel.adminLocationHistory.collectAsState()
                     val tcpConnected by viewModel.tcpConnected.collectAsState()
                     val pendingButtonIds by viewModel.pendingButtonIds.collectAsState()
+                    val adminAutoClose by viewModel.adminAutoClose.collectAsState()
+
+                    // Admin mode shows a live GPS location on a map - auto-close it after
+                    // HaRemoteViewModel's fixed timeout instead of leaving it open indefinitely
+                    // if someone walks away. Works from either admin sub-screen (PIN entry or
+                    // the map itself) since it just pops everything above "home".
+                    LaunchedEffect(adminAutoClose) {
+                        if (adminAutoClose) {
+                            viewModel.consumeAdminAutoClose()
+                            viewModel.resetAdminSession()
+                            navController.popBackStack("home", inclusive = false)
+                        }
+                    }
 
                     NavHost(navController = navController, startDestination = "home") {
                         composable("home") {
@@ -200,6 +215,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /** Global touch hook so the admin auto-close timer (see [HaRemoteViewModel.
+     *  onAdminInteraction]) is postponed by *any* touch while admin mode is open - panning or
+     *  zooming the map included, since those are just touch gestures on this same window and
+     *  need no special-casing here. [HaRemoteViewModel.onAdminInteraction] itself is a no-op
+     *  unless the auto-close timer is actually running, so calling it on every touch anywhere
+     *  in the app (not just the admin screens) is harmless. Only observes - never consumes -
+     *  the event, so normal click/gesture handling (including GoogleMap's own pan/zoom
+     *  handling) is completely unaffected. */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) {
+            viewModel.onAdminInteraction()
+        }
+        return super.dispatchTouchEvent(ev)
     }
 
     private fun requestRuntimePermissions() {

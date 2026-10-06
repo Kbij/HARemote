@@ -17,6 +17,8 @@ import com.koen.haremote.network.tcp.AdminTcpClient
 import com.koen.haremote.network.tcp.LocationHistoryRequestMessage
 import com.koen.haremote.network.tcp.LocationHistoryResponseMessage
 import com.koen.haremote.network.tcp.TcpConnectionStatus
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +26,15 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 private const val TAG_ADMIN = "AdminMode"
+
+/** Admin mode shows a live GPS location on a map - it shouldn't stay open indefinitely if
+ *  someone walks away from the phone. Idle timeout for the whole admin flow (PIN entry +
+ *  map): starts counting down from the moment admin mode opens, and is restarted by any
+ *  touch (MainActivity's dispatchTouchEvent - covers map panning/zooming too, since those
+ *  are gestures on the same window) or by picking a different client
+ *  (requestLocationHistory) - see [onAdminInteraction]. Only genuine inactivity for the
+ *  full timeout closes it. */
+private const val ADMIN_AUTO_CLOSE_TIMEOUT_MS = 120_000L
 
 class HaRemoteViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -68,6 +79,14 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
 
     private val _adminConnected = MutableStateFlow(false)
     val adminConnected: StateFlow<Boolean> = _adminConnected.asStateFlow()
+
+    /** One-shot signal for MainActivity: pulses true when [ADMIN_AUTO_CLOSE_TIMEOUT_MS] has
+     *  elapsed since admin mode was opened, so it navigates back to "home". See
+     *  [consumeAdminAutoClose]. */
+    private val _adminAutoClose = MutableStateFlow(false)
+    val adminAutoClose: StateFlow<Boolean> = _adminAutoClose.asStateFlow()
+
+    private var adminAutoCloseJob: Job? = null
 
     private val adminTcpClient = AdminTcpClient(
         deviceName = Build.MODEL,
@@ -236,6 +255,41 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
             "Admin-scherm geopend, verbonden=${adminTcpClient.isConnected()}"
         )
         adminTcpClient.reconnectNow()
+        startAdminAutoCloseTimer()
+    }
+
+    /** (Re)starts the auto-close countdown - cancels any timer already running so re-entering
+     *  admin mode (or any future spot that wants to postpone the close) always gets a fresh
+     *  [ADMIN_AUTO_CLOSE_TIMEOUT_MS]. */
+    private fun startAdminAutoCloseTimer() {
+        adminAutoCloseJob?.cancel()
+        adminAutoCloseJob = viewModelScope.launch {
+            delay(ADMIN_AUTO_CLOSE_TIMEOUT_MS)
+            DiagnosticLogger.log(
+                getApplication(), TAG_ADMIN,
+                "Admin-scherm automatisch gesloten na ${ADMIN_AUTO_CLOSE_TIMEOUT_MS / 1000}s"
+            )
+            _adminAutoClose.value = true
+        }
+    }
+
+    /** Called by MainActivity right after it navigates back to "home" in response to
+     *  [adminAutoClose] pulsing true, so the same close doesn't fire again. */
+    fun consumeAdminAutoClose() {
+        _adminAutoClose.value = false
+    }
+
+    /** Postpones the auto-close by a fresh [ADMIN_AUTO_CLOSE_TIMEOUT_MS] - called on any
+     *  touch anywhere while admin mode is open (MainActivity.dispatchTouchEvent, which also
+     *  covers panning/zooming the map - those are just touch gestures on the same window)
+     *  and on every client switch (see [requestLocationHistory]). Only restarts the timer if
+     *  one is actually running (`isActive` - i.e. admin mode is currently open), so this is
+     *  safe to call unconditionally from a global touch hook without it accidentally
+     *  starting a countdown while the user is just on the home screen. */
+    fun onAdminInteraction() {
+        if (adminAutoCloseJob?.isActive == true) {
+            startAdminAutoCloseTimer()
+        }
     }
 
     /** Sends the PIN typed on the admin gate screen. Result arrives via [adminAuthResult]. */
@@ -252,8 +306,21 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
     /** Requests the last [minutes] of location history for [client]. Result arrives via
      *  [adminLocationHistory]. Re-sent by the admin screen whenever the selected client or
      *  window changes - the server re-checks admin capability live on every call, there's no
-     *  "already authenticated" shortcut to rely on here. */
+     *  "already authenticated" shortcut to rely on here.
+     *
+     *  **Bug fix (10 sept 2026):** this used to leave the *previous* client's
+     *  [adminLocationHistory] value in place until the new client's response arrived -
+     *  [resetAdminSession] only clears it on leaving/entering admin mode, not on a plain client
+     *  switch within the map screen. AdminMapScreen has no way to tell "this history belongs to
+     *  the client I just picked" from "this is stale data for the one before it", so for that
+     *  gap it kept showing the old client's marker/polyline/geofence under the newly-selected
+     *  client's name - and never showed its loading spinner either, since that's gated on
+     *  `history == null`, which stayed false after the very first ever load. Clearing it here,
+     *  before the request goes out, makes every client switch show the spinner instead of a
+     *  flash of the wrong client's position. */
     fun requestLocationHistory(client: String, minutes: Int = LocationHistoryRequestMessage.DEFAULT_MINUTES) {
+        _adminLocationHistory.value = null
+        onAdminInteraction() // switching client counts as activity - postpone the auto-close
         val sent = adminTcpClient.sendLocationHistoryRequest(client, minutes)
         DiagnosticLogger.log(
             getApplication(),
@@ -269,11 +336,14 @@ class HaRemoteViewModel(application: Application) : AndroidViewModel(application
         _adminAuthResult.value = null
         _adminClients.value = emptyList()
         _adminLocationHistory.value = null
+        adminAutoCloseJob?.cancel()
+        _adminAutoClose.value = false
     }
 
     override fun onCleared() {
         super.onCleared()
         adminTcpClient.stop()
+        adminAutoCloseJob?.cancel()
     }
 
     companion object {
