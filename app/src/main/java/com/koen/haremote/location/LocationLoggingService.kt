@@ -11,6 +11,8 @@ import android.content.IntentFilter
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -28,6 +30,7 @@ import com.koen.haremote.R
 import com.koen.haremote.data.SettingsRepository
 import com.koen.haremote.network.tcp.GeofenceStatusMessage
 import com.koen.haremote.network.tcp.GpsLocationMessage
+import com.koen.haremote.network.tcp.SqliteLocationOutbox
 import com.koen.haremote.network.tcp.TcpConnectionStatus
 import com.koen.haremote.network.tcp.TcpLocationClient
 import kotlinx.coroutines.CoroutineScope
@@ -63,13 +66,32 @@ import kotlinx.coroutines.launch
  * ([GeofenceRenewalAlarmScheduler]) on top in case the EXIT callback is ever missed. While that
  * geofence is active, regular GPS/network polling is paused entirely (see
  * [pauseLocationUpdatesForGeofence]) — only the 30-min renewal check still touches location.
+ *
+ * **Server unreachable (6 okt 2026).** Two guarantees, both spelled out in
+ * [TcpLocationClient]'s class doc:
+ * - *it keeps trying, at least every 5 minutes, forever.* The client's own thread does that as
+ *   long as it gets to run; this service adds the outside view on top (see
+ *   [superviseTcpConnection]): a 5-minute alarm that only exists while disconnected
+ *   ([AlarmScheduler.scheduleReconnectCheck] - an alarm, because unlike a thread it also fires
+ *   when the CPU has gone to sleep), the existing watchdog alarm and wake-lock timer, and a
+ *   [networkCallback] that triggers an immediate attempt the moment a network becomes available
+ *   instead of waiting out the rest of a backoff.
+ * - *no location gets lost in the meantime.* Every fix this service reports goes into
+ *   [locationOutbox] (a small on-device database) first and stays there until the server has
+ *   confirmed it - through an outage, a service kill or a reboot.
  */
 class LocationLoggingService : Service(), LocationListener {
 
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var locationManager: LocationManager
     private lateinit var tcpClient: TcpLocationClient
+    private lateinit var locationOutbox: SqliteLocationOutbox
     private lateinit var geofencingClient: GeofencingClient
+
+    /** Set first thing in [onDestroy]. Callbacks that arrive after that (posted to
+     *  [mainHandler] by the TCP thread while the service was being torn down) must not arm any
+     *  new alarms on behalf of a service that no longer exists. */
+    @Volatile private var destroyed = false
     private var wakeLock: PowerManager.WakeLock? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -101,7 +123,25 @@ class LocationLoggingService : Service(), LocationListener {
     private val wakeLockRenewalRunnable = object : Runnable {
         override fun run() {
             wakeLock?.takeIf { it.isHeld }?.acquire(WAKE_LOCK_TIMEOUT_MS)
+            // Piggybacks on this timer (every 4 min): one more, alarm-independent chance to
+            // notice a TCP connection thread that died or got stuck.
+            superviseTcpConnection()
             mainHandler.postDelayed(this, WAKE_LOCK_RENEWAL_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Fires whenever Android's default network changes to one that is usable (wifi came back,
+     * mobile data reconnected, left flight mode, ...). After a long outage the TCP client may be
+     * up to 5 minutes away from its next attempt - no reason to sit that out when the one thing
+     * that was missing has just come back. Called on a ConnectivityManager thread;
+     * [TcpLocationClient.kick] is thread-safe and a no-op while connected.
+     */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (destroyed || tcpClient.isConnected()) return
+            log("Tcp", "Netwerk beschikbaar - meteen opnieuw proberen te verbinden")
+            tcpClient.kick(force = true)
         }
     }
 
@@ -119,7 +159,10 @@ class LocationLoggingService : Service(), LocationListener {
         settingsRepository = SettingsRepository(applicationContext)
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         geofencingClient = LocationServices.getGeofencingClient(this)
-        tcpClient = TcpLocationClient(deviceName = Build.MODEL, listener = tcpListener)
+        locationOutbox = SqliteLocationOutbox(applicationContext) { dropped ->
+            log("Tcp", "Lokale locatiebuffer vol - $dropped oudste locatie(s) weggegooid")
+        }
+        tcpClient = TcpLocationClient(deviceName = Build.MODEL, listener = tcpListener, outbox = locationOutbox)
 
         startForeground(NOTIFICATION_ID, buildNotification(connected = false))
         acquireWakeLock()
@@ -127,6 +170,16 @@ class LocationLoggingService : Service(), LocationListener {
         requestLocationUpdates(intervalSeconds = 0)
         tcpClient.start(host = "", port = 0) // real host/port arrive via observeSettings()
         observeSettings()
+        registerNetworkCallback()
+        // Not connected yet at this point - armed until tcpListener reports a connection.
+        AlarmScheduler.scheduleReconnectCheck(applicationContext)
+        serviceScope.launch {
+            // Off the main thread: this is the first thing to touch the outbox database.
+            val waiting = tcpClient.pendingLocationCount()
+            if (waiting > 0) {
+                log("Tcp", "$waiting locatie(s) uit een vorige sessie staan nog in de lokale buffer")
+            }
+        }
 
         // Make sure the watchdog is (re)armed as long as this service is alive.
         AlarmScheduler.scheduleWatchdog(applicationContext)
@@ -150,10 +203,15 @@ class LocationLoggingService : Service(), LocationListener {
                 return START_STICKY
             }
             ACTION_GEOFENCE_RENEWAL_CHECK -> {
+                superviseTcpConnection()
                 performGeofenceRenewalCheck()
                 return START_STICKY
             }
         }
+        // Every other start is a "make sure everything is still running" start: the 15-minute
+        // watchdog, the 5-minute reconnect alarm (both via RestartAlarmReceiver), a system
+        // restart, or the app itself. All of them double as a check on the TCP connection.
+        superviseTcpConnection()
         // START_STICKY: if the system kills this process to reclaim memory, it will
         // try to recreate the service and call onStartCommand again with a null intent.
         return START_STICKY
@@ -178,6 +236,45 @@ class LocationLoggingService : Service(), LocationListener {
                     stopSelf()
                 }
             }
+        }
+    }
+
+    /**
+     * The outside view on the TCP connection - see the class doc. Called from every periodic
+     * hook this service has (reconnect alarm, watchdog alarm, wake-lock timer, geofence renewal).
+     *
+     * [TcpLocationClient.kick] restarts the connection thread if it died or got stuck, and starts
+     * a connection attempt right away if the last one is 5 minutes or more ago (which only
+     * happens if the thread was frozen through its own deadline - e.g. the CPU was asleep until
+     * the very alarm that led here). Then the reconnect alarm is re-armed for another 5 minutes
+     * if there is still no connection, or cancelled if there is: it only ever runs while
+     * disconnected, so a healthy connection costs no extra wake-ups.
+     */
+    private fun superviseTcpConnection() {
+        if (destroyed) return
+        tcpClient.kick()
+        if (tcpClient.isConnected()) {
+            AlarmScheduler.cancelReconnectCheck(applicationContext)
+        } else {
+            AlarmScheduler.scheduleReconnectCheck(applicationContext)
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.registerDefaultNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            // Purely an optimisation (reconnect sooner) - the alarm and the client's own retry
+            // loop work without it.
+            log("Tcp", "Netwerk-callback registreren mislukt: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        runCatching {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(networkCallback)
         }
     }
 
@@ -375,6 +472,8 @@ class LocationLoggingService : Service(), LocationListener {
             return
         }
         lastAcceptedFix = location
+        // Stored on the device first, removed once the server has confirmed it - so this is
+        // safe to call whether or not there is a connection right now (see TcpLocationClient).
         tcpClient.sendLocation(
             GpsLocationMessage(
                 latitude = location.latitude,
@@ -759,8 +858,14 @@ class LocationLoggingService : Service(), LocationListener {
         // whole point of persisting it (see GeofenceState / resumeGeofenceIfNeeded). Explicit
         // teardown happens in onStartCommand (ACTION_STOP) and observeSettings() instead.
         log("Service", "onDestroy")
+        destroyed = true
         runCatching { locationManager.removeUpdates(this) }
+        unregisterNetworkCallback()
+        AlarmScheduler.cancelReconnectCheck(applicationContext)
         tcpClient.stop()
+        // Locations that were never confirmed simply stay in the outbox (on disk) for the next
+        // time the service runs; closing only releases the database handle.
+        locationOutbox.close()
         TcpConnectionStatus.update(false)
         mainHandler.removeCallbacks(wakeLockRenewalRunnable)
         wakeLock?.takeIf { it.isHeld }?.release()
@@ -799,10 +904,23 @@ class LocationLoggingService : Service(), LocationListener {
             }
         }
 
+        override fun onDiagnostic(message: String) {
+            // Straight to the log (DiagnosticLogger is thread-safe) - why an attempt failed and
+            // when the next one is due, and what is happening to the buffered locations.
+            log("Tcp", message)
+        }
+
         override fun onConnectionStateChanged(connected: Boolean) {
             mainHandler.post {
                 log("Tcp", if (connected) "Connected" else "Disconnected")
+                if (destroyed) return@post
                 updateNotification(connected)
+                // The reconnect alarm exists exactly as long as there is no connection.
+                if (connected) {
+                    AlarmScheduler.cancelReconnectCheck(applicationContext)
+                } else {
+                    AlarmScheduler.scheduleReconnectCheck(applicationContext)
+                }
             }
             // Not posted to mainHandler like the lines above - TcpConnectionStatus is a plain
             // thread-safe StateFlow, and HomeScreen's LED should reflect a drop the instant it
@@ -903,6 +1021,7 @@ class LocationLoggingService : Service(), LocationListener {
         fun stop(context: Context) {
             context.stopService(Intent(context, LocationLoggingService::class.java))
             AlarmScheduler.cancelWatchdog(context)
+            AlarmScheduler.cancelReconnectCheck(context)
         }
     }
 }

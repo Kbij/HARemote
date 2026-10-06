@@ -23,7 +23,16 @@ class RestartAlarmReceiver : BroadcastReceiver() {
         // and the service's own "onCreate" log line is visible: it tells us the watchdog fired
         // but the service didn't consider itself worth (re)starting, versus firing and the
         // service failing to start at all.
-        DiagnosticLogger.log(appContext, "Watchdog", "Alarm fired")
+        //
+        // Since 6 okt 2026 this receiver also serves the 5-minute reconnect alarm (see
+        // AlarmScheduler.scheduleReconnectCheck). Both do exactly the same thing here - make
+        // sure the service is running and poke it; the service's onStartCommand then checks
+        // its TCP connection - so the only difference is the log line.
+        if (intent.action == AlarmScheduler.ACTION_RECONNECT_CHECK) {
+            DiagnosticLogger.log(appContext, "Tcp", "Reconnect-alarm fired (nog geen verbinding met de server)")
+        } else {
+            DiagnosticLogger.log(appContext, "Watchdog", "Alarm fired")
+        }
         // Reschedule the *next* alarm right away, synchronously - before the async settings
         // read below. Each firing only re-arms the next one, so if the process gets
         // frozen/killed while that coroutine is still running (very plausible: this receiver
