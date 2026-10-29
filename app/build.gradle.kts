@@ -78,6 +78,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.maps.compose)
     implementation(libs.play.services.location)
+    // Play Services pulls in androidx.fragment 1.0.0 transitively; the Activity Result APIs
+    // (registerForActivityResult in MainActivity) need >= 1.3.0 - lint InvalidFragmentVersionForActivityResult.
+    implementation(libs.androidx.fragment)
 
     debugImplementation(libs.androidx.ui.tooling)
 }

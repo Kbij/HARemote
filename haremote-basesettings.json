@@ -1,0 +1,88 @@
+{
+    "hosts": [
+        {
+            "id": 1,
+            "name": "ha.lan",
+            "baseUrl": "http://ha.lan:8123",
+            "basePath": "api/services/script",
+            "bearerToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJkMjE1MTY1NWYzZTQ0ZWNjYWVhMDhjMDRlNzA0M2FmZiIsImlhdCI6MTc4ODg4Mzg4OSwiZXhwIjoyMTA0MjQzODg5fQ.SACu8PmRbwFdc9rM-a-pWSHCPXW6iM4s7jtDLN72GTI"
+        }
+    ],
+    "buttons": [
+        {
+            "id": 1,
+            "label": "TV Kijken",
+            "icon": "MOVIE",
+            "hostId": 1,
+            "path": "sfeer_tv",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 2,
+            "label": "Netflix",
+            "icon": "MOVIE",
+            "hostId": 1,
+            "path": "sfeer_netflix",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 3,
+            "label": "Plex",
+            "icon": "MOVIE",
+            "hostId": 1,
+            "path": "sfeer_plex",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 4,
+            "label": "ChromeCast",
+            "icon": "MOVIE",
+            "hostId": 1,
+            "path": "sfeer_chromecast",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 5,
+            "label": "Spotify",
+            "icon": "MOVIE",
+            "hostId": 1,
+            "path": "sfeer_spotify",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 6,
+            "label": "Alles Uit",
+            "icon": "VOLUME",
+            "hostId": 1,
+            "path": "sfeer_alles_uit",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 7,
+            "label": "Zone2 Aan",
+            "icon": "VOLUME",
+            "hostId": 1,
+            "path": "zone2_aan",
+            "method": "POST",
+            "body": ""
+        },
+        {
+            "id": 8,
+            "label": "Zone2 Uit",
+            "icon": "VOLUME",
+            "hostId": 1,
+            "path": "zone2_uit",
+            "method": "POST",
+            "body": ""
+        }
+    ],
+    "tcpServerHost": "paradijs.mooo.com",
+    "tcpServerPort": 5678,
+    "gpsLoggingEnabled": true
+}
